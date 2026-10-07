@@ -1,0 +1,876 @@
+# JustFlip Data Entry Automation — Full Execution Plan
+
+**Version:** 1.0  
+**Date:** September 2026  
+**Scope:** End-to-end automation of property data entry from internet sources into JustFlip's production database, orchestrated by **n8n**, with mandatory human review before any data touches production.
+
+---
+
+## Table of Contents
+
+1. [The Problem & What We're Solving](#1-the-problem)
+2. [The Full Story — How It Works End-to-End](#2-the-full-story)
+3. [Architecture Diagram](#3-architecture)
+4. [Component Deep-Dive](#4-components)
+5. [Staging Database Schema](#5-staging-schema)
+6. [n8n Workflow Design](#6-n8n-workflows)
+7. [Human Review Dashboard](#7-review-dashboard)
+8. [Approval → Production Push (Exact API Mapping)](#8-approval-push)
+9. [Update Existing Project Workflow](#9-update-workflow)
+10. [Failure Handling & Recovery](#10-failure-handling)
+11. [Implementation Roadmap](#11-roadmap)
+
+---
+
+## 1. The Problem {#1-the-problem}
+
+Today, adding a single property to JustFlip requires a human to:
+
+1. Find the property on a developer website or portal (99acres, MagicBricks, Housing.com, RERA portals, builder sites).
+2. Manually copy-paste ~30+ fields: name, builder, city, zone, location, RERA, possession date, towers, floors, units, pricing, amenities, description, images.
+3. Upload images one by one. Create floor plan entries per unit type.
+4. Map to the correct `cityId`, `zoneId`, `locationId`, `builderId` by searching the dashboard.
+5. Submit via the dashboard form → hits `POST /project/create-from-dashboard`.
+
+**This takes 30–45 minutes per property. At scale (100+ properties/week), it's unsustainable.**
+
+### What We Want Instead
+
+```
+Human effort per property: 30-45 minutes  →  2-3 minutes (review & approve only)
+```
+
+---
+
+## 2. The Full Story — How It Works End-to-End {#2-the-full-story}
+
+Here is the complete lifecycle of a scraped property, from discovery to live on JustFlip:
+
+### Act 1: Discovery & Scraping
+1. **n8n Cron Trigger** fires every 6 hours (or on-demand via webhook).
+2. n8n sends a list of **seed URLs** (e.g., "all new projects in Bengaluru on 99acres") to a **Scraping Worker** (a Node.js service using Crawlee + Playwright).
+3. The scraper navigates each URL, waits for dynamic content to load, and extracts:
+   - Raw HTML of the property page.
+   - Any JSON-LD structured data embedded in the page.
+   - Screenshot of the page (proof for reviewers).
+   - All image URLs (banner, gallery, floor plans).
+
+### Act 2: AI Extraction & Normalization
+4. n8n receives the raw scraped payload and sends it to **Google Gemini 2.0 Flash API** with a strict prompt:
+   > *"Extract the following fields from this real estate property page. Return valid JSON matching this exact schema. If a field is not found, return null. NEVER guess RERA numbers, prices, or dates."*
+5. Gemini returns a clean, structured JSON payload with: project name, builder name, city, zone/area, locality, RERA, possession status/date, property type, unit configurations (type, area, min/max price), amenities list, and image URLs.
+
+### Act 3: Entity Resolution (The Critical Step)
+6. n8n takes the extracted `builderName` and queries your existing **Portal-Service API** to find a matching `builderId`:
+   - `GET /builder?search=Brigade Group` → If found, use existing `builderId`.
+   - If NOT found → Flag the record as `needs_builder_creation` for the human reviewer.
+7. Same for **City → Zone → Location** resolution:
+   - `GET /city?search=Bengaluru` → Get `cityId`.
+   - `GET /zone?cityId=xxx&search=East` → Get `zoneId`.
+   - `GET /location?zoneId=xxx&search=Whitefield` → Get `locationId`.
+   - If any entity is missing → Flag it. The reviewer will create it or correct the mapping.
+
+### Act 4: Deduplication Check
+8. n8n checks if this project already exists in JustFlip:
+   - **RERA match:** `GET /project?search={rera_number}` → If exact RERA match found, this is a **duplicate** or a **price update**, not a new project.
+   - **Fuzzy name match:** `GET /project?search={project_name}&cityId={cityId}` → If similar name + same city, flag as potential duplicate.
+   - If no match → It's a genuinely new property.
+
+### Act 5: Staging (Quarantine)
+9. n8n writes the fully normalized payload into a **`staged_projects`** table in your PostgreSQL database. This table is completely **isolated from production**. No user will ever see staged data on the website.
+10. Each staged record gets:
+    - A `confidence_score` (0.0–1.0) based on how many fields were extracted vs. left null.
+    - A list of `validation_warnings` (e.g., `["missing_rera", "builder_not_found", "possible_duplicate_of:uuid"]`).
+    - The original `source_url` and `screenshot_url` for the reviewer.
+
+### Act 6: Human Review (The Gatekeeper)
+11. Your team opens the **Review Dashboard** (`/admin/data-review` in your Next.js app).
+12. They see a queue of pending items sorted by confidence score (highest first = easiest to approve).
+13. For each item, they see a **split-screen view**:
+    - **Left side:** The original scraped webpage screenshot or embedded live preview.
+    - **Right side:** An editable form pre-filled with the AI-extracted data, with dropdowns for City/Zone/Location/Builder that query your existing database.
+14. The reviewer can:
+    - **✅ Approve & Push** — Sends the data to production. Creates the project + units + media + amenities in one transaction.
+    - **✏️ Edit & Approve** — Correct a wrong field (e.g., fix the location mapping), then push.
+    - **❌ Reject** — Mark as spam, duplicate, or invalid. Record the reason.
+    - **⏭️ Skip** — Come back to it later.
+
+### Act 7: Production Push
+15. On approval, the review dashboard calls your **existing** `POST /project/create-from-dashboard` endpoint with the exact payload format it already expects.
+16. The project is created with `status: 'inactive'` and `approval: 'pending'` (your existing defaults), meaning it won't appear on the public site until your team explicitly publishes it through the normal dashboard flow.
+17. After successful creation, the staged record is marked `status: 'approved'` and linked to the new `projectId`.
+
+### Act 8: Notification & Audit
+18. n8n sends a **Slack/Discord/Email notification** to the team: *"Project 'Brigade Horizon' in Whitefield, Bengaluru has been approved and created. [View in Dashboard]"*
+19. Full audit trail is maintained: who approved it, when, what was changed from the AI extraction, and the original source URL.
+
+---
+
+## 3. Architecture {#3-architecture}
+
+```mermaid
+graph TD
+    subgraph Trigger["Trigger Layer"]
+        T1["n8n Cron (Every 6h)"]
+        T2["n8n Manual Webhook"]
+    end
+
+    subgraph Scraping["Scraping Layer (Node.js Worker)"]
+        S1["Crawlee + Playwright"]
+        S2["Rotating Proxy Pool"]
+        S3["Screenshot Capture"]
+        S4["Image Downloader"]
+    end
+
+    subgraph AI["AI Extraction Layer"]
+        A1["Gemini 2.0 Flash API"]
+        A2["JSON Schema Enforcement"]
+    end
+
+    subgraph Resolution["Entity Resolution (via Portal-Service APIs)"]
+        R1["Builder Lookup: GET /builder?search=..."]
+        R2["City Lookup: GET /city"]
+        R3["Zone Lookup: GET /zone"]
+        R4["Location Lookup: GET /location"]
+        R5["Duplicate Check: GET /project?search=..."]
+    end
+
+    subgraph Staging["Staging Layer (PostgreSQL)"]
+        ST1[("staged_projects table")]
+        ST2["Confidence Scoring"]
+        ST3["Validation Warnings"]
+    end
+
+    subgraph Human["Human Review (JUSTFLIP_NEXT)"]
+        H1["/admin/data-review"]
+        H2["Split-Screen: Source vs Form"]
+        H3["Approve / Edit / Reject"]
+    end
+
+    subgraph Production["Production Push"]
+        P1["POST /project/create-from-dashboard"]
+        P2["Portal-Service Transaction"]
+        P3["Redis Cache Invalidation"]
+    end
+
+    subgraph Notify["Notifications"]
+        N1["Slack / Discord / Email"]
+    end
+
+    T1 --> S1
+    T2 --> S1
+    S2 --> S1
+    S1 --> S3
+    S1 --> S4
+    S1 --> A1
+    A1 --> A2
+    A2 --> R1
+    R1 --> R2
+    R2 --> R3
+    R3 --> R4
+    R4 --> R5
+    R5 --> ST1
+    ST1 --> ST2
+    ST2 --> ST3
+    ST3 --> H1
+    H1 --> H2
+    H2 --> H3
+    H3 -- "Approve" --> P1
+    P1 --> P2
+    P2 --> P3
+    P3 --> N1
+    H3 -- "Reject" --> N1
+```
+
+---
+
+## 4. Component Deep-Dive {#4-components}
+
+### 4A. n8n — The Orchestration Brain
+
+**Why n8n and not pure code?**
+- Visual workflow builder — non-developers on your team can see and understand the pipeline.
+- Built-in retry, error handling, and webhook triggers.
+- Native HTTP Request nodes to call your Portal-Service APIs.
+- Easy to add new scraping sources without touching code.
+- Self-hosted (free, runs on your own server alongside Portal-Service).
+
+**n8n Setup:**
+```bash
+# Self-hosted n8n via Docker (runs alongside your Portal-Service)
+docker run -d --name n8n \
+  -p 5678:5678 \
+  -v n8n_data:/home/node/.n8n \
+  --restart unless-stopped \
+  n8nio/n8n
+```
+
+### 4B. Scraping Worker — Separate Node.js Microservice
+
+The scraper runs as a **standalone Node.js service** (not inside n8n) because:
+- Playwright/Crawlee needs a full Chromium browser, which is too heavy for n8n's execution model.
+- It can run on a separate machine or container with more RAM.
+- n8n triggers it via HTTP webhook and receives results back.
+
+```
+Portal-Service (Port 3004) ← Your existing backend
+Scraping-Worker (Port 4000) ← New microservice
+n8n            (Port 5678) ← Orchestration
+Redis          (Port 6379) ← Already running (shared queue)
+```
+
+### 4C. AI Extraction — Gemini 2.0 Flash
+
+The AI extraction prompt is **the single most important piece of the system**. Here's the exact prompt template:
+
+```
+You are a real estate data extraction engine for JustFlip.in.
+Extract property details from the following webpage content.
+Return ONLY valid JSON matching this exact schema.
+Rules:
+- If a field is not explicitly stated on the page, return null. NEVER guess.
+- RERA numbers must be copied exactly as shown. If not found, return null.
+- Prices must be converted to pure integers in the smallest currency unit (e.g., ₹1.25 Cr = 12500000).
+- Unit types should be normalized to: "1BHK", "2BHK", "3BHK", "4BHK", "5BHK", "Studio", "Penthouse", "Villa", "Plot", "Duplex".
+- Amenity names should be common English names (e.g., "Swimming Pool", "Gymnasium", "24x7 Security").
+- Property type must be one of: "apartment", "villa", "plot", "penthouse", "row house", "farmhouse".
+
+Required JSON Schema:
+{
+  "name": "string",
+  "builderName": "string",
+  "description": "string (2-3 sentences about the project)",
+  "type": "apartment|villa|plot|penthouse|row house|farmhouse",
+  "rera": "string or null",
+  "city": "string",
+  "zone": "string (area/direction, e.g., East, West, North, South)",
+  "location": "string (locality/neighborhood name)",
+  "towers": "integer or null",
+  "floors": "string or null (e.g., 'G+14')",
+  "totalUnits": "integer or null",
+  "landParcel": "string or null (e.g., '5.2 Acres')",
+  "possessionStatus": "string (e.g., 'Under Construction', 'Ready to Move', 'Pre-Launch')",
+  "possessionDate": "ISO date string or null",
+  "coordinates": { "lat": number, "lng": number } or null,
+  "units": [
+    {
+      "type": "string (e.g., '2BHK')",
+      "currency": "INR|AED|USD",
+      "minPrice": integer or null,
+      "maxPrice": integer or null,
+      "interiorArea": integer or null (in sq.ft)
+    }
+  ],
+  "amenities": ["string"],
+  "images": [
+    { "type": "image", "title": "banner|logo|floor plan|other", "url": "string", "alt": "string" }
+  ]
+}
+```
+
+---
+
+## 5. Staging Database Schema {#5-staging-schema}
+
+Add this table to your `Portal-Service` PostgreSQL database:
+
+```sql
+-- Migration: Create staged_projects table
+CREATE TYPE staged_status AS ENUM (
+    'pending_review',    -- Waiting for human review
+    'approved',          -- Approved and pushed to production (new or updated)
+    'rejected',          -- Rejected by reviewer
+    'failed',            -- Push to production failed (retry-able)
+    'duplicate',         -- Auto-detected or manually marked duplicate
+    'update_pending'     -- Matched existing project, waiting for update review
+);
+
+CREATE TYPE staged_action AS ENUM (
+    'create',            -- This is a new project, will POST to create-from-dashboard
+    'update',            -- This matches an existing project, will PUT to /:id
+    'skip'               -- Reviewer decided to skip (no action)
+);
+
+CREATE TABLE staged_projects (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- Source tracking
+    source_url          TEXT NOT NULL,
+    source_domain       VARCHAR(255) NOT NULL,       -- 'magicbricks.com', '99acres.com', etc.
+    screenshot_url      TEXT,                         -- Captured page screenshot for proof
+    scraped_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+
+    -- AI-extracted data (full payload ready for create-from-dashboard)
+    extracted_data      JSONB NOT NULL,               -- The complete normalized JSON
+
+    -- Entity resolution results
+    resolved_builder_id UUID,                         -- Matched builderId (null if not found)
+    resolved_city_id    UUID,                         -- Matched cityId
+    resolved_zone_id    UUID,                         -- Matched zoneId (for reference only)
+    resolved_location_id UUID,                        -- Matched locationId
+
+    -- Quality metrics
+    confidence_score    NUMERIC(3,2) DEFAULT 0.50,    -- 0.00 to 1.00
+    validation_warnings JSONB DEFAULT '[]'::jsonb,    -- ["missing_rera", "builder_not_found"]
+
+    -- Dedup & update tracking
+    matched_project_id  UUID,                         -- Existing project this might match
+    is_duplicate        BOOLEAN DEFAULT FALSE,
+    action_type         staged_action DEFAULT 'create', -- What to do: create new or update existing
+    price_change_diff   JSONB,                         -- Diff of what changed (old vs new prices/units)
+
+    -- Review state
+    status              staged_status DEFAULT 'pending_review',
+    reviewed_by         UUID,                         -- Admin user who reviewed
+    review_notes        TEXT,                          -- Why rejected, or what was changed
+    reviewed_at         TIMESTAMP WITH TIME ZONE,
+
+    -- Production linkage (after approval)
+    created_project_id  UUID,                         -- The projectId created in production
+    pushed_at           TIMESTAMP WITH TIME ZONE,
+    push_error          TEXT,                          -- Error message if push failed
+
+    -- Timestamps
+    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Indexes for the review dashboard
+CREATE INDEX idx_staged_status ON staged_projects(status);
+CREATE INDEX idx_staged_domain ON staged_projects(source_domain);
+CREATE INDEX idx_staged_confidence ON staged_projects(confidence_score DESC);
+CREATE INDEX idx_staged_created ON staged_projects(created_at DESC);
+```
+
+### Why JSONB for `extracted_data`?
+
+Because the AI extraction output maps **directly** to the `req.body` payload that your existing [`createProjectFromDashboard`](file:///c:/Users/Mark/Desktop/JustFlip/Portal-Service/controllers/portal/project.controller.js#L2506) expects. When the reviewer clicks "Approve", we literally `POST` the contents of `extracted_data` (with resolved IDs injected) to `/project/create-from-dashboard`. Zero new backend code needed for the push.
+
+---
+
+## 6. n8n Workflow Design {#6-n8n-workflows}
+
+### Workflow 1: Scrape → Extract → Stage
+
+```
+┌─────────────┐    ┌─────────────────┐    ┌──────────────────┐    ┌───────────────────┐
+│ Cron Trigger │───▶│ HTTP Request:   │───▶│ HTTP Request:    │───▶│ Resolve Builder   │
+│ (Every 6h)  │    │ Scraping Worker  │    │ Gemini API       │    │ GET /builder?     │
+│             │    │ POST :4000/scrape│    │ Extract JSON     │    │ search=name       │
+└─────────────┘    └─────────────────┘    └──────────────────┘    └───────────────────┘
+                                                                          │
+                   ┌─────────────────┐    ┌──────────────────┐    ┌───────▼───────────┐
+                   │ Write to        │◀───│ Confidence Score  │◀───│ Resolve City/     │
+                   │ staged_projects │    │ Calculator        │    │ Zone/Location     │
+                   │ (PostgreSQL)    │    │                   │    │ GET /city, /zone  │
+                   └─────────────────┘    └──────────────────┘    └───────────────────┘
+                          │
+                   ┌──────▼──────────┐
+                   │ Slack Notify:   │
+                   │ "3 new items    │
+                   │ ready for       │
+                   │ review"         │
+                   └─────────────────┘
+```
+
+### Workflow 2: Approval Push (Triggered by Review Dashboard)
+
+```
+┌──────────────────┐    ┌──────────────────┐    ┌─────────────────────────┐
+│ Webhook Trigger: │───▶│ Validate payload │───▶│ POST /project/          │
+│ POST /n8n/       │    │ (all IDs         │    │ create-from-dashboard   │
+│ approve-staged   │    │  resolved?)      │    │ (Portal-Service :3004)  │
+└──────────────────┘    └──────────────────┘    └─────────────────────────┘
+                                                          │
+                        ┌──────────────────┐    ┌─────────▼───────────────┐
+                        │ Slack Notify:    │◀───│ Update staged_projects  │
+                        │ "Project created │    │ status = 'approved',    │
+                        │ successfully"    │    │ created_project_id = id │
+                        └──────────────────┘    └─────────────────────────┘
+```
+
+### n8n Error Handling Configuration
+
+Every HTTP Request node in n8n should be configured with:
+
+| Setting | Value | Why |
+|:---|:---|:---|
+| **Retry on Fail** | `true` | Network blips, API rate limits |
+| **Max Retries** | `3` | Don't hammer a dead service |
+| **Wait Between Retries** | `5000ms` (exponential) | Back off gracefully |
+| **Continue on Fail** | `true` (for scraping) | One bad URL shouldn't kill the batch |
+| **Continue on Fail** | `false` (for production push) | NEVER silently skip a failed DB write |
+
+---
+
+## 7. Human Review Dashboard {#7-review-dashboard}
+
+### UI Design — Split-Screen Review
+
+```
++-------------------------------------------------------------------------------------------------------+
+| 📋 Data Review Queue                                            [Filter: Pending ▾] [Sort: Newest ▾]  |
++-------------------------------------------------------------------------------------------------------+
+| Source: 99acres.com  •  Scraped: 2 hours ago  •  Score: 92%  •  ⚠ 1 warning           [Skip] [Reject] |
++--------------------------------------------------+----------------------------------------------------+
+| 📷 SOURCE PROOF                                  | 📝 EXTRACTED DATA (Editable Form)                  |
+|                                                  |                                                    |
+| ┌──────────────────────────────────────────┐     | Project Name: [Brigade Horizon           ]         |
+| │                                          │     | Builder:      [Brigade Group         ✓  ] ▾       |
+| │     (Captured Screenshot of the          │     | Type:         [apartment             ✓  ] ▾       |
+| │      original webpage at scrape time)    │     |                                                    |
+| │                                          │     | City:         [Bengaluru              ✓ ] ▾       |
+| │     Shows: Pricing, RERA, Floor Plans    │     | Zone:         [East                   ✓ ] ▾       |
+| │     exactly as they appeared on source   │     | Location:     [Whitefield             ✓ ] ▾       |
+| │                                          │     | RERA:         [PRM/KA/RERA/...           ]         |
+| │                                          │     |                                                    |
+| └──────────────────────────────────────────┘     | Possession:   [Under Construction        ]         |
+|                                                  | Towers: [4]  Floors: [G+22]  Units: [1200]         |
+| 🔗 Open Original Page ↗                          |                                                    |
+|                                                  | ── Units ──────────────────────────────────         |
+|                                                  | 2BHK  1050 sqft  ₹85,00,000 - ₹92,00,000          |
+|                                                  | 3BHK  1450 sqft  ₹1,12,00,000 - ₹1,25,00,000      |
+|                                                  |                                                    |
+|                                                  | ── Amenities ──────────────────────────────         |
+|                                                  | [✓] Swimming Pool  [✓] Gymnasium  [✓] Clubhouse    |
+|                                                  | [✓] 24x7 Security  [ ] Add more...                 |
+|                                                  |                                                    |
+|                                                  | ── Warnings ───────────────────────────────         |
+|                                                  | ⚠ RERA number could not be verified                |
++--------------------------------------------------+----------------------------------------------------+
+|                                    [❌ Reject with Reason]  [✏️ Save Draft]  [✅ Approve & Push to DB] |
++-------------------------------------------------------------------------------------------------------+
+```
+
+### Review Dashboard API Endpoints (New in Portal-Service)
+
+```javascript
+// GET /staging/pending    — List all pending staged_projects (paginated)
+// GET /staging/:id        — Get single staged project with full extracted_data
+// PATCH /staging/:id      — Update extracted_data (reviewer edits)
+// POST /staging/:id/approve — Approve: push to production via create-from-dashboard
+// POST /staging/:id/reject  — Reject: mark as rejected with reason
+```
+
+---
+
+## 8. Approval → Production Push — Exact API Mapping {#8-approval-push}
+
+When the reviewer clicks **"Approve & Push"**, here's the exact payload transformation from `staged_projects.extracted_data` to your existing `POST /project/create-from-dashboard`:
+
+### Your Existing API Expects This Payload:
+*(From [`createProjectFromDashboard`](file:///c:/Users/Mark/Desktop/JustFlip/Portal-Service/controllers/portal/project.controller.js#L2506-L2677))*
+
+```json
+{
+  "name": "Brigade Horizon",
+  "description": "Premium 2 & 3 BHK apartments in Whitefield...",
+  "type": "apartment",
+  "rera": "PRM/KA/RERA/1251/308/PR/220211/004698",
+  "towers": 4,
+  "floors": "G+22",
+  "totalUnits": 1200,
+  "landParcel": "12.5",
+  "possessionStatus": "Under Construction",
+  "possessionDate": "2028-06-30",
+  "pincode": "560066",
+  "coordinates": { "lat": 12.9698, "lng": 77.7499 },
+  "tags": null,
+  "transactionTag": "sale",
+
+  "builderId": "uuid-of-matched-builder",
+  "cityId": "uuid-of-bengaluru",
+  "locationId": "uuid-of-whitefield",
+  "uploadedBy": "uuid-of-system-automation-user",
+
+  "units": [
+    { "type": "2BHK", "currency": "INR", "minPrice": 8500000, "maxPrice": 9200000, "interiorArea": 1050 },
+    { "type": "3BHK", "currency": "INR", "minPrice": 11200000, "maxPrice": 12500000, "interiorArea": 1450 }
+  ],
+
+  "medias": [
+    { "type": "image", "title": "banner", "url": "https://media.justflip.in/...", "alt": "Brigade Horizon Banner" },
+    { "type": "image", "title": "logo", "url": "https://media.justflip.in/...", "alt": "Brigade Horizon Logo" }
+  ],
+
+  "amenities": [48, 47, 62, 66],
+
+  "features": [
+    { "type": "advantage", "title": "Prime Location", "description": "5 min from Whitefield IT Hub" }
+  ],
+
+  "faqs": [
+    { "question": "What is the RERA number?", "answer": "PRM/KA/RERA/..." }
+  ]
+}
+```
+
+### The Transformation Logic:
+
+```javascript
+// In the approval endpoint or n8n workflow
+function buildProductionPayload(stagedProject) {
+  const { extracted_data, resolved_builder_id, resolved_city_id, resolved_location_id } = stagedProject;
+
+  return {
+    ...extracted_data,
+
+    // Override with resolved UUIDs (human may have corrected these)
+    builderId: resolved_builder_id,
+    cityId: resolved_city_id,
+    locationId: resolved_location_id,
+
+    // System automation user (create a dedicated user for audit trail)
+    uploadedBy: process.env.AUTOMATION_USER_ID,
+
+    // Amenities: map extracted names to existing amenity IDs
+    amenities: await mapAmenityNamesToIds(extracted_data.amenities),
+
+    // Defaults
+    transactionTag: extracted_data.transactionTag || 'sale',
+    tags: extracted_data.tags || null,
+  };
+}
+```
+
+### Amenity Name → ID Resolution
+
+Your `amenities` table has `{ id: INTEGER, name: STRING }`. The AI extracts names like `"Swimming Pool"`. We need to map them:
+
+```javascript
+async function mapAmenityNamesToIds(amenityNames = []) {
+  if (!amenityNames.length) return [];
+
+  const amenities = await Amenity.findAll({
+    where: {
+      name: { [Op.in]: amenityNames }
+    },
+    attributes: ['id', 'name']
+  });
+
+  // Return only IDs of amenities that exist in the master table
+  return amenities.map(a => a.id);
+}
+```
+
+---
+
+## 9. Update Existing Project Workflow {#9-update-workflow}
+
+When a scraped property **already exists** in your database, the system doesn't just flag it as a duplicate and throw it away — it detects what's changed and lets your reviewer **update the existing project** with fresh data.
+
+### How Duplicates Become Updates
+
+During the dedup check (Act 4 in the main pipeline), when a match is found:
+
+```javascript
+// In the n8n entity resolution workflow
+const existingProject = await findMatchingProject(extractedData);
+
+if (existingProject) {
+  // Fetch the existing project's full data (units, media, etc.)
+  const existingFull = await fetchProjectById(existingProject.id);
+  
+  // Compute what's different
+  const diff = computePriceAndUnitDiff(existingFull, extractedData);
+  
+  // Stage as an UPDATE, not a create
+  await insertStagedProject({
+    ...extractedData,
+    matched_project_id: existingProject.id,
+    action_type: 'update',                  // <-- KEY: tells reviewer this is an update
+    status: 'update_pending',
+    price_change_diff: diff,                 // <-- Shows reviewer exactly what changed
+    is_duplicate: false,                     // It's not a duplicate, it's an update
+    validation_warnings: ['existing_project_matched']
+  });
+}
+```
+
+### The Diff Engine — What Changed?
+
+The `price_change_diff` JSON captures a side-by-side comparison:
+
+```json
+{
+  "summary": "2 unit prices changed, 1 new unit added",
+  "changes": [
+    {
+      "field": "units[0].minPrice",
+      "unit_type": "2BHK",
+      "old": 8500000,
+      "new": 8900000,
+      "change": "+4.7%"
+    },
+    {
+      "field": "units[0].maxPrice",
+      "unit_type": "2BHK",
+      "old": 9200000,
+      "new": 9600000,
+      "change": "+4.3%"
+    },
+    {
+      "field": "units[2]",
+      "unit_type": "4BHK",
+      "old": null,
+      "new": { "type": "4BHK", "minPrice": 18500000, "maxPrice": 21000000, "interiorArea": 2200 },
+      "change": "NEW UNIT"
+    }
+  ],
+  "unchanged_fields": ["name", "builder", "city", "location", "rera", "type"],
+  "updated_fields": ["possessionStatus", "units"]
+}
+```
+
+### Review Dashboard — Update View
+
+When the reviewer opens an `update_pending` item, they see a **different UI** than new projects:
+
+```
++-------------------------------------------------------------------------------------------------------+
+| 🔄 UPDATE REVIEW — Brigade Horizon (Existing Project)                                     [Skip]     |
++-------------------------------------------------------------------------------------------------------+
+| Matched to: Brigade Horizon (ID: abc-123-def)     [🔗 Open in Dashboard]                              |
++--------------------------------------------------+----------------------------------------------------+
+| 📊 WHAT CHANGED (Auto-Detected)                  | 📝 UPDATED DATA (Editable)                         |
+|                                                  |                                                    |
+| ┌──────────────────────────────────────────┐     | These fields will be UPDATED on the existing       |
+| │ Unit Price Changes:                      │     | project. Unchecked fields will NOT be changed.     |
+| │                                          │     |                                                    |
+| │ 2BHK: ₹85L → ₹89L  (+4.7%)  ✅ Apply   │     | ☑ Possession: [Ready to Move     ] (was: U/C)     |
+| │ 2BHK: ₹92L → ₹96L  (+4.3%)  ✅ Apply   │     |                                                    |
+| │                                          │     | ── Units (will REPLACE all existing units) ──      |
+| │ New Unit Added:                          │     | ☑ 2BHK  1050 sqft  ₹89,00,000 - ₹96,00,000       |
+| │ 4BHK: ₹1.85Cr - ₹2.1Cr      ✅ Apply   │     | ☑ 3BHK  1450 sqft  ₹1,15,00,000 - ₹1,28,00,000   |
+| │                                          │     | ☑ 4BHK  2200 sqft  ₹1,85,00,000 - ₹2,10,00,000   |
+| │ Possession Changed:                     │     |                                                    |
+| │ "Under Construction" → "Ready to Move"  │     | ── Unchanged (will NOT be modified) ──             |
+| │                                 ✅ Apply │     | Name: Brigade Horizon                              |
+| │                                          │     | Builder: Brigade Group                             |
+| │ No changes to:                           │     | RERA: PRM/KA/RERA/...                              |
+| │ Name, Builder, RERA, Location, Type      │     | City/Zone/Location: Bengaluru/East/Whitefield      |
+| └──────────────────────────────────────────┘     |                                                    |
+|                                                  |                                                    |
+| 📷 Source: 99acres.com  [🔗 View Original]       |                                                    |
++--------------------------------------------------+----------------------------------------------------+
+|                  [❌ Skip (No Changes Needed)]  [🔄 Apply Selected Updates]  [✅ Full Replace & Push]  |
++-------------------------------------------------------------------------------------------------------+
+```
+
+### Three Update Actions for the Reviewer
+
+| Action | What It Does | API Call |
+|:---|:---|:---|
+| **🔄 Apply Selected Updates** | Only sends the changed fields (units, prices, possession) to the update API. Unchanged fields are left alone. | `PUT /project/:matched_project_id` with partial payload |
+| **✅ Full Replace & Push** | Replaces ALL project data (units, medias, features, etc.) with the freshly scraped version. Use when the source has significantly more/better data. | `PUT /project/:matched_project_id` with full payload |
+| **❌ Skip** | The existing data is fine, no update needed. Mark staged record as `status: 'duplicate'`. | No API call. Update staging record only. |
+
+### Production Push — Update API Mapping
+
+Your existing [`updateProject`](file:///c:/Users/Mark/Desktop/JustFlip/Portal-Service/controllers/portal/project.controller.js#L25-L190) endpoint at `PUT /project/:id` already handles everything we need:
+
+```javascript
+// What your updateProject controller does (already built):
+// 1. Finds the project by ID
+// 2. Uses updateIfChanged() — only modifies fields that are different
+// 3. Re-generates slug if name/builder/city/location changed
+// 4. REPLACES units, medias, features, FAQs, amenities via destroy + bulkCreate
+// 5. Resets approval to 'pending' and status to 'inactive' (safety net!)
+// 6. All in a single transaction — atomic, safe
+```
+
+**The update payload sent to `PUT /project/:id`:**
+
+```json
+{
+  "possessionStatus": "Ready to Move",
+  "units": [
+    { "type": "2BHK", "currency": "INR", "minPrice": 8900000, "maxPrice": 9600000, "interiorArea": 1050 },
+    { "type": "3BHK", "currency": "INR", "minPrice": 11500000, "maxPrice": 12800000, "interiorArea": 1450 },
+    { "type": "4BHK", "currency": "INR", "minPrice": 18500000, "maxPrice": 21000000, "interiorArea": 2200 }
+  ]
+}
+```
+
+> [!IMPORTANT]
+> **Safety Net:** Your `updateProject` controller automatically sets `approval: 'pending'` and `status: 'inactive'` on every update (lines 40, 117-118). This means even after an automated update, the project **goes back into your normal approval queue** before it appears on the live site. Double human review.
+
+### The Update Transformation Logic
+
+```javascript
+function buildUpdatePayload(stagedProject) {
+  const { extracted_data, matched_project_id, price_change_diff } = stagedProject;
+  
+  // For "Apply Selected Updates" — only send changed fields
+  const payload = {};
+  
+  for (const change of price_change_diff.changes) {
+    if (change.field === 'possessionStatus') {
+      payload.possessionStatus = extracted_data.possessionStatus;
+    }
+    if (change.field === 'possessionDate') {
+      payload.possessionDate = extracted_data.possessionDate;
+    }
+    // ... other top-level fields
+  }
+  
+  // Units are always sent as a complete array (your API does destroy + bulkCreate)
+  if (price_change_diff.updated_fields.includes('units')) {
+    payload.units = extracted_data.units;
+  }
+  
+  // Media: only if new images were found
+  if (price_change_diff.updated_fields.includes('medias')) {
+    payload.medias = extracted_data.medias;
+  }
+  
+  return {
+    projectId: matched_project_id,  // The existing project to update
+    payload
+  };
+}
+
+// API call:
+// PUT /project/{matched_project_id}
+// Body: payload
+```
+
+### n8n Update Workflow
+
+```
+┌──────────────────┐    ┌──────────────────┐    ┌─────────────────────────┐
+│ Webhook Trigger: │───▶│ Build update     │───▶│ PUT /project/:id        │
+│ POST /n8n/       │    │ payload from     │    │ (Portal-Service :3004)  │
+│ update-staged    │    │ selected changes │    │                         │
+└──────────────────┘    └──────────────────┘    └─────────────────────────┘
+                                                          │
+                        ┌──────────────────┐    ┌─────────▼───────────────┐
+                        │ Slack Notify:    │◀───│ Update staged_projects  │
+                        │ "Project updated │    │ status = 'approved',    │
+                        │ with new prices" │    │ action_type = 'update'  │
+                        └──────────────────┘    └─────────────────────────┘
+```
+
+### Complete Decision Tree for Duplicate Detection
+
+```mermaid
+graph TD
+    A["Scraped Property"] --> B{"RERA Match?"}
+    B -- "Yes (exact match)" --> C{"Compare Data"}
+    B -- "No" --> D{"Fuzzy Name + City Match?"}
+    D -- "Yes (score > 0.85)" --> C
+    D -- "No" --> E["Stage as NEW (action_type: create)"]
+    
+    C --> F{"Prices / Units Changed?"}
+    F -- "Yes" --> G["Stage as UPDATE (action_type: update)\nCompute price_change_diff"]
+    F -- "No" --> H{"Other Fields Changed?\n(possession, description, etc.)"}
+    H -- "Yes" --> G
+    H -- "No" --> I["Auto-skip: Nothing new\nStage as DUPLICATE"]
+    
+    G --> J["Reviewer Sees Update View"]
+    J --> K{"Reviewer Decision"}
+    K -- "Apply Updates" --> L["PUT /project/:id"]
+    K -- "Full Replace" --> M["PUT /project/:id (all fields)"]
+    K -- "Skip" --> N["Mark as duplicate"]
+    
+    E --> O["Reviewer Sees Create View"]
+    O --> P{"Reviewer Decision"}
+    P -- "Approve" --> Q["POST /project/create-from-dashboard"]
+    P -- "Reject" --> R["Mark as rejected"]
+```
+
+---
+
+## 10. Failure Handling & Recovery {#10-failure-handling}
+
+### Every Failure Scenario Mapped:
+
+| Stage | Failure | Detection | Recovery | Human Action Needed? |
+|:---|:---|:---|:---|:---|
+| **Scraping** | Target site is down or blocks IP | HTTP 403/503/timeout | n8n retries 3x with 30s backoff. If still fails, log error and skip URL. Retry in next cron cycle. | ❌ No |
+| **Scraping** | Anti-bot CAPTCHA triggered | Page content is empty / CAPTCHA detection | Switch proxy. If persists, mark URL as `captcha_blocked` and alert team on Slack. | ⚠️ Maybe (switch proxy provider) |
+| **Scraping** | Page layout changed (selectors broken) | AI extraction returns mostly null fields | Confidence score drops below 0.3 → auto-skip staging. Alert on Slack: "Scraper may be broken for domain X". | ✅ Yes (update scraper) |
+| **AI Extraction** | Gemini API rate limit (429) | HTTP 429 response | n8n retries with exponential backoff (5s, 15s, 45s). | ❌ No |
+| **AI Extraction** | Gemini returns invalid/hallucinated JSON | JSON parse fails or schema validation fails | Discard this extraction. Log the raw response for debugging. Move to next property. | ❌ No |
+| **AI Extraction** | Gemini returns null for critical fields (name, city) | Post-extraction validation check | Do NOT stage this record. Log as `extraction_failed`. | ❌ No |
+| **Entity Resolution** | Builder not found in JustFlip DB | API returns empty result | Stage the record WITH `validation_warnings: ["builder_not_found"]` and `resolved_builder_id: null`. Reviewer must create the builder first or map manually. | ✅ Yes |
+| **Entity Resolution** | City/Location not found | API returns empty result | Same as above. Flag as `location_not_found`. Reviewer maps it. | ✅ Yes |
+| **Staging Write** | PostgreSQL connection error | Write throws error | n8n retries 3x. If still fails, send Slack alert with full payload so nothing is lost. | ⚠️ Maybe (DB issue) |
+| **Deduplication** | False positive duplicate | Fuzzy match is too aggressive | Reviewer sees the `matched_project_id` and can override: "This is NOT a duplicate, create as new." | ✅ Yes (that's why humans review) |
+| **Production Push** | `create-from-dashboard` returns 400 error | API error response | Update `staged_projects` with `status: 'failed'`, `push_error: error.message`. Reviewer can fix the data and retry. | ✅ Yes |
+| **Production Push** | `create-from-dashboard` returns 500 / timeout | Server error | n8n retries 2x. If still fails, mark as `failed` with error. The staging record is preserved — nothing is lost. | ✅ Yes (investigate server) |
+| **Update Push** | `PUT /project/:id` returns 404 (project deleted between scrape and review) | API 404 response | Convert the staged record from `action_type: 'update'` to `action_type: 'create'`. Notify reviewer: "Original project no longer exists — create as new?" | ✅ Yes |
+| **Update Push** | `PUT /project/:id` returns 400 (validation error on updated fields) | API 400 response | Same as create failure — mark `status: 'failed'`, preserve payload. Reviewer fixes and retries. | ✅ Yes |
+| **Update Push** | Update succeeds but new `approval: 'pending'` blocks live display longer than expected | Project disappears from live site during re-approval | Expected behavior by design. Alert the team via Slack so they can fast-track the re-approval. | ✅ Yes (fast-track approval) |
+| **Production Push** | Duplicate name error from API | API returns "Project with this name already exists" | Mark staged record as `duplicate`. Notify reviewer. | ✅ Yes |
+| **Image Upload** | CDN upload fails | HTTP error during image transfer | Store original image URLs in staging. Reviewer can manually trigger re-upload. Images are not blocking — project can be created without them. | ⚠️ Maybe |
+
+### The Golden Rule of Failure Handling:
+> **No data is ever lost.** Every scraped payload is persisted in `staged_projects` before any production operation is attempted. If production push fails, the staging record remains intact with the error message, and the reviewer can fix and retry.
+
+### Dead Letter Queue (DLQ)
+For records that fail production push 3+ times:
+- Move to `status: 'failed'` with full error context.
+- Send a daily digest to Slack: *"5 staged projects failed to push. [Review Failed Items]"*
+- These stay in the staging table until manually resolved — they never get auto-deleted.
+
+---
+
+## 11. Implementation Roadmap {#11-roadmap}
+
+### Phase 1: Foundation (Week 1–2)
+| Task | Details |
+|:---|:---|
+| Set up n8n | Docker deploy, configure PostgreSQL credentials and Portal-Service base URL |
+| Create `staged_projects` table | Run the SQL migration in Portal-Service |
+| Build staging CRUD endpoints | `GET/PATCH/POST` routes in Portal-Service for the staging table |
+| Create automation system user | A dedicated `uploadedBy` user for audit trail |
+
+### Phase 2: Scraping Worker (Week 2–3)
+| Task | Details |
+|:---|:---|
+| Initialize `Scraping-Worker` service | New Node.js project with Crawlee + Playwright |
+| Build scrapers for first 2 targets | Start with builder websites (simpler, less anti-bot) |
+| Proxy setup | Configure residential proxy rotation |
+| Screenshot capture | Page screenshot on every scrape for reviewer proof |
+| n8n → Scraper integration | Webhook trigger + HTTP response |
+
+### Phase 3: AI Extraction & Entity Resolution (Week 3–4)
+| Task | Details |
+|:---|:---|
+| Gemini API integration in n8n | HTTP Request node with the extraction prompt |
+| JSON schema validation | Validate Gemini output before staging |
+| Entity resolution workflow | n8n nodes to lookup builder, city, zone, location via Portal-Service APIs |
+| Confidence scoring logic | Calculate score based on field completeness |
+| Deduplication check | RERA + fuzzy name matching |
+
+### Phase 4: Review Dashboard (Week 4–5)
+| Task | Details |
+|:---|:---|
+| Build `/admin/data-review` page | Next.js page with split-screen layout |
+| Review queue with filters | Pending/Approved/Rejected, sorted by confidence |
+| Editable form with entity dropdowns | City/Zone/Location/Builder autocomplete |
+| Approve action | Calls `POST /project/create-from-dashboard` |
+| Reject action | Updates staging record with reason |
+
+### Phase 5: Hardening & Scale (Week 5–6)
+| Task | Details |
+|:---|:---|
+| Slack/Discord notifications | New items, approvals, failures |
+| Failed items retry UI | Retry button for `status: 'failed'` records |
+| Add more scraping targets | 99acres, MagicBricks, Housing.com |
+| Performance tuning | Batch processing, concurrent scraping limits |
+
+---
+
+## Summary: Why This Design Works for JustFlip
+
+| Concern | How It's Handled |
+|:---|:---|
+| **"Bad data on the live site"** | Impossible. Data goes through staging → human review → explicit approval before touching production. Projects are created with `status: inactive`, `approval: pending`. |
+| **"What if the AI hallucinates?"** | The reviewer sees the original webpage screenshot side-by-side. Any hallucinated field is immediately visible. |
+| **"What if scraping breaks?"** | Failures are logged and retried. Staging records preserve everything. Daily Slack digests flag persistent issues. |
+| **"What if a push to production fails?"** | The staging record stays with `status: failed` and the error message. Reviewer can fix and retry. Nothing is lost. |
+| **"What if a builder/location doesn't exist yet?"** | Flagged as a validation warning. Reviewer creates the missing entity first, then approves. |
+| **"Audit trail?"** | Every staged record tracks: source URL, screenshot, who reviewed it, when, what was changed, and the resulting `projectId`. |
+| **"Can we add more sources later?"** | Yes. Add a new Crawlee scraper and a new n8n trigger. The extraction → staging → review → push pipeline is source-agnostic. |
